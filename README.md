@@ -9,7 +9,7 @@ Download CelebA dataset from http://mmlab.ie.cuhk.edu.hk/projects/CelebA.html
 python discogan_celeba.py -g n -d <path/to/CelebA>
 ```
 
-## WGAN with MNIST(without GPU)
+## DiscoGAN with CelebA(without GPU)
 ```
 python discogan_celeba.py -d <path/to/CelebA>
 ```
