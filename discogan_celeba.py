@@ -68,20 +68,20 @@ class PreprocessedDataset(chainer.dataset.DatasetMixin):
 class Generator(chainer.Chain):
     def __init__(self, ):
         super(Generator, self).__init__(
-            conv1=L.Convolution2D(None, 128, 4, 2, 1),
+            conv1=L.Convolution2D(None, 64, 4, 2, 1),
             conv2=L.Convolution2D(None, 128, 4, 2, 1),
             norm2=L.BatchNormalization(128),
-            conv3=L.Convolution2D(None, 64, 4, 2, 1),
-            norm3=L.BatchNormalization(64),
-            conv4=L.Convolution2D(None, 32, 4, 2, 1),
-            norm4=L.BatchNormalization(32),
+            conv3=L.Convolution2D(None, 256, 4, 2, 1),
+            norm3=L.BatchNormalization(256),
+            conv4=L.Convolution2D(None, 512, 4, 2, 1),
+            norm4=L.BatchNormalization(512),
 
-            deconv1=L.Deconvolution2D(None, 64, 4, 2, 1),
-            dnorm1=L.BatchNormalization(64),
+            deconv1=L.Deconvolution2D(None, 256, 4, 2, 1),
+            dnorm1=L.BatchNormalization(256),
             deconv2=L.Deconvolution2D(None, 128, 4, 2, 1),
             dnorm2=L.BatchNormalization(128),
-            deconv3=L.Deconvolution2D(None, 128, 4, 2, 1),
-            dnorm3=L.BatchNormalization(128),
+            deconv3=L.Deconvolution2D(None, 64, 4, 2, 1),
+            dnorm3=L.BatchNormalization(64),
             deconv4=L.Deconvolution2D(None, 3, 4, 2, 1),
             )
 
@@ -103,13 +103,13 @@ class Generator(chainer.Chain):
 class Discriminator(chainer.Chain):
     def __init__(self):
         super(Discriminator, self).__init__(
-            conv1=L.Convolution2D(None, 128, 4, 2, 1),
+            conv1=L.Convolution2D(None, 64, 4, 2, 1),
             conv2=L.Convolution2D(None, 128, 4, 2, 1),
             norm2=L.BatchNormalization(128),
-            conv3=L.Convolution2D(None, 64, 4, 2, 1),
-            norm3=L.BatchNormalization(64),
-            conv4=L.Convolution2D(None, 32, 4, 2, 1),
-            norm4=L.BatchNormalization(32),
+            conv3=L.Convolution2D(None, 256, 4, 2, 1),
+            norm3=L.BatchNormalization(256),
+            conv4=L.Convolution2D(None, 512, 4, 2, 1),
+            norm4=L.BatchNormalization(512),
             fc=L.Linear(None, 1)
             )
 
@@ -142,6 +142,8 @@ class DiscoGANUpdater(training.StandardUpdater):
         self.iteration = 0
 
     def update_core(self):
+
+        # update discriminator
         # read data
         batch_a = self._iterators['main'].next()
         x_a = self.converter(batch_a, self.device)
@@ -155,16 +157,12 @@ class DiscoGANUpdater(training.StandardUpdater):
         x_ab = self.generator_ab(x_a)
         x_ba = self.generator_ba(x_b)
 
-        # reconversion
-        x_aba = self.generator_ba(x_ab)
-        x_bab = self.generator_ab(x_ba)
-
         # discriminate
-        y_a = self.discriminator_a(F.concat((x_a, x_ba), 0))
-        y_a_real, y_a_fake = F.split_axis(y_a, 2, 0)
+        y_a_real = self.discriminator_a(x_a)
+        y_a_fake = self.discriminator_a(x_ba)
 
-        y_b = self.discriminator_b(F.concat((x_b, x_ab), 0))
-        y_b_real, y_b_fake = F.split_axis(y_b, 2, 0)
+        y_b_real = self.discriminator_a(x_b)
+        y_b_fake = self.discriminator_a(x_ab)
 
         # compute loss
         # SCE(x, 0) = softplus(x)
@@ -174,11 +172,43 @@ class DiscoGANUpdater(training.StandardUpdater):
         loss_gan_fake = F.sum(
             F.softplus(y_a_fake) + F.softplus(y_b_fake)) / batchsize
 
+        loss_dis = loss_gan_real + loss_gan_fake
+
+        # update
+        self.discriminator_a.cleargrads()
+        self.discriminator_b.cleargrads()
+        loss_dis.backward()
+        self._optimizers['discriminator_a'].update()
+        self._optimizers['discriminator_b'].update()
+
+        # update generator
+        # read data
+        batch_a = self._iterators['main'].next()
+        x_a = self.converter(batch_a, self.device)
+
+        batch_b = self._iterators['second'].next()
+        x_b = self.converter(batch_b, self.device)
+
+        # conversion
+        x_ab = self.generator_ab(x_a)
+        x_ba = self.generator_ba(x_b)
+
+        # reconversion
+        x_aba = self.generator_ba(x_ab)
+        x_bab = self.generator_ab(x_ba)
+
+        # discriminate
+        y_a_fake = self.discriminator_a(x_ba)
+        y_b_fake = self.discriminator_b(x_ab)
+
+        # compute loss
+        loss_gan = F.sum(
+            F.softplus(-y_a_fake) + F.softplus(-y_b_fake)) / batchsize
+
         loss_const_a = F.mean_squared_error(x_a, x_aba)
         loss_const_b = F.mean_squared_error(x_b, x_bab)
 
-        loss_gen = - loss_gan_fake + loss_const_a + loss_const_b
-        loss_dis = loss_gan_real + loss_gan_fake
+        loss_gen = loss_gan + loss_const_a + loss_const_b
 
         # update
         self.generator_ab.cleargrads()
@@ -186,12 +216,6 @@ class DiscoGANUpdater(training.StandardUpdater):
         loss_gen.backward()
         self._optimizers['generator_ab'].update()
         self._optimizers['generator_ba'].update()
-
-        self.discriminator_a.cleargrads()
-        self.discriminator_b.cleargrads()
-        loss_dis.backward()
-        self._optimizers['discriminator_a'].update()
-        self._optimizers['discriminator_b'].update()
 
         # report
         chainer.reporter.report({
@@ -272,8 +296,8 @@ def main():
         train_a, args.batchsize, n_processes=args.loaderjob // 2)
     train_iter_b = chainer.iterators.MultiprocessIterator(
         train_b, args.batchsize, n_processes=args.loaderjob // 2)
-    valid_iter_a = chainer.iterators.SerialIterator(valid_a, 10)
-    valid_iter_b = chainer.iterators.SerialIterator(valid_b, 10)
+    valid_iter_a = chainer.iterators.SerialIterator(valid_a, 10, shuffle=False)
+    valid_iter_b = chainer.iterators.SerialIterator(valid_b, 10, shuffle=False)
 
     updater = DiscoGANUpdater(train_iter_a, train_iter_b, opt_g_ab, opt_g_ba,
                               opt_d_a, opt_d_b, device=args.gpu)
@@ -301,34 +325,25 @@ def main():
             x_ba = chainer.cuda.to_cpu(x_ba.data)
 
             # reshape
-            x_a = np.concatenate((x_a, x_ab), 0)
-            x_a = x_a.reshape(2, 10, 3, 64, 64)
-            x_a = x_a.transpose(0, 3, 1, 4, 2)
-            x_a = x_a.reshape((2 * 64, 10 * 64, 3))
-
-            x_b = np.concatenate((x_b, x_ba), 0)
-            x_b = x_b.reshape(2, 10, 3, 64, 64)
-            x_b = x_b.transpose(0, 3, 1, 4, 2)
-            x_b = x_b.reshape((2 * 64, 10 * 64, 3))
+            x = np.concatenate((x_a, x_ab, x_b, x_ba), 0)
+            x = x.reshape(4, 10, 3, 64, 64)
+            x = x.transpose(0, 3, 1, 4, 2)
+            x = x.reshape((4 * 64, 10 * 64, 3))
 
             # to [0, 255]
-            x_a += 1
-            x_a *= (255 / 2)
-            x_a = np.asarray(np.clip(x_a, 0, 255), dtype=np.uint8)
-
-            x_b += 1
-            x_b *= (255 / 2)
-            x_b = np.asarray(np.clip(x_b, 0, 255), dtype=np.uint8)
+            x += 1
+            x *= (255 / 2)
+            x = np.asarray(np.clip(x, 0, 255), dtype=np.uint8)
 
             preview_dir = '{}/preview'.format(dst)
             preview_path = preview_dir +\
                 '/image{:0>5}.png'.format(trainer.updater.epoch)
             if not os.path.exists(preview_dir):
                 os.makedirs(preview_dir)
-            Image.fromarray(x_a).save(preview_path.replace('.png', '_a.png'))
-            Image.fromarray(x_b).save(preview_path.replace('.png', '_b.png'))
+            Image.fromarray(x).save(preview_path)
         return make_image
 
+    trainer.extend(extensions.dump_graph('loss/gan/real'))
     trainer.extend(extensions.snapshot(), trigger=(args.epoch, 'epoch'))
     trainer.extend(extensions.LogReport())
     trainer.extend(
@@ -340,7 +355,7 @@ def main():
     trainer.extend(extensions.PrintReport(
         ['epoch', 'loss/gan/real', 'loss/gan/fake',
          'loss/const', 'elapsed_time']))
-    trainer.extend(extensions.ProgressBar())
+    trainer.extend(extensions.ProgressBar(update_interval=5))
     trainer.extend(out_generated_image(valid_iter_a, valid_iter_b,
                                        generator_ab, generator_ba,
                                        args.gpu, args.out),
