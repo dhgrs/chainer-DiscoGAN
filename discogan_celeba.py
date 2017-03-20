@@ -103,14 +103,14 @@ class Generator(chainer.Chain):
 class Discriminator(chainer.Chain):
     def __init__(self):
         super(Discriminator, self).__init__(
-            conv1=L.Convolution2D(None, 64, 4, 2, 1),
-            conv2=L.Convolution2D(None, 128, 4, 2, 1),
-            norm2=L.BatchNormalization(128),
-            conv3=L.Convolution2D(None, 256, 4, 2, 1),
-            norm3=L.BatchNormalization(256),
-            conv4=L.Convolution2D(None, 512, 4, 2, 1),
-            norm4=L.BatchNormalization(512),
-            fc=L.Linear(None, 1)
+            conv1=L.Convolution2D(None, 512, 4, 2, 1),
+            conv2=L.Convolution2D(None, 256, 4, 2, 1),
+            norm2=L.BatchNormalization(256),
+            conv3=L.Convolution2D(None, 128, 4, 2, 1),
+            norm3=L.BatchNormalization(128),
+            conv4=L.Convolution2D(None, 64, 4, 2, 1),
+            norm4=L.BatchNormalization(64),
+            conv5=L.Convolution2D(None, 1, 4)
             )
 
     def __call__(self, x, test=False):
@@ -121,8 +121,10 @@ class Discriminator(chainer.Chain):
         h4 = F.leaky_relu(self.norm4(self.conv4(h3), test=test))
 
         # full connect
-        y = self.fc(h4)
-        return y
+        # the size of feature map is 4x4.
+        # So convolution with 4x4 filter is similar to full connect.
+        y = self.conv5(h4)
+        return y, [h2, h3, h4]
 
 
 class DiscoGANUpdater(training.StandardUpdater):
@@ -140,10 +142,27 @@ class DiscoGANUpdater(training.StandardUpdater):
         self.device = device
         self.converter = convert.concat_examples
         self.iteration = 0
+        self.xp = self.generator_ab.xp
+
+    def compute_loss_gan(self, y_real, y_fake):
+        batchsize = y_real.shape[0]
+        loss_dis = 0.5 * F.sum(F.softplus(-y_real) + F.softplus(y_fake))
+        loss_gen = F.sum(F.softplus(-y_fake))
+        return loss_dis / batchsize, loss_gen / batchsize
+
+    def compute_loss_feat(self, feats_real, feats_fake):
+        losses = 0
+        for feat_real, feat_fake in zip(feats_real, feats_fake):
+            feat_real_mean = F.sum(feat_real, 0) / feat_real.shape[0]
+            feat_fake_mean = F.sum(feat_fake, 0) / feat_fake.shape[0]
+            l2 = (feat_real_mean - feat_fake_mean) ** 2
+            loss = F.sum(l2) / l2.size
+            # loss = F.mean_absolute_error(feat_real_mean, feat_fake_mean)
+            losses += loss
+        return losses
 
     def update_core(self):
 
-        # update discriminator
         # read data
         batch_a = self._iterators['main'].next()
         x_a = self.converter(batch_a, self.device)
@@ -157,71 +176,63 @@ class DiscoGANUpdater(training.StandardUpdater):
         x_ab = self.generator_ab(x_a)
         x_ba = self.generator_ba(x_b)
 
-        # discriminate
-        y_a_real = self.discriminator_a(x_a)
-        y_a_fake = self.discriminator_a(x_ba)
-
-        y_b_real = self.discriminator_a(x_b)
-        y_b_fake = self.discriminator_a(x_ab)
-
-        # compute loss
-        # SCE(x, 0) = softplus(x)
-        # SCE(x, 1) = softplus(-x)
-        loss_gan_real = F.sum(
-            F.softplus(-y_a_real) + F.softplus(-y_b_real)) / batchsize
-        loss_gan_fake = F.sum(
-            F.softplus(y_a_fake) + F.softplus(y_b_fake)) / batchsize
-
-        loss_dis = loss_gan_real + loss_gan_fake
-
-        # update
-        self.discriminator_a.cleargrads()
-        self.discriminator_b.cleargrads()
-        loss_dis.backward()
-        self._optimizers['discriminator_a'].update()
-        self._optimizers['discriminator_b'].update()
-
-        # update generator
-        # read data
-        batch_a = self._iterators['main'].next()
-        x_a = self.converter(batch_a, self.device)
-
-        batch_b = self._iterators['second'].next()
-        x_b = self.converter(batch_b, self.device)
-
-        # conversion
-        x_ab = self.generator_ab(x_a)
-        x_ba = self.generator_ba(x_b)
-
         # reconversion
         x_aba = self.generator_ba(x_ab)
         x_bab = self.generator_ab(x_ba)
 
+        # reconstruction loss
+        recon_loss_a = F.mean_squared_error(x_a, x_aba)
+        recon_loss_b = F.mean_squared_error(x_b, x_bab)
+
         # discriminate
-        y_a_fake = self.discriminator_a(x_ba)
-        y_b_fake = self.discriminator_b(x_ab)
+        y_a_real, feats_a_real = self.discriminator_a(x_a)
+        y_a_fake, feats_a_fake = self.discriminator_a(x_ba)
+
+        y_b_real, feats_b_real = self.discriminator_b(x_b)
+        y_b_fake, feats_b_fake = self.discriminator_b(x_ab)
+
+        # GAN loss
+        gan_loss_dis_a, gan_loss_gen_a =\
+            self.compute_loss_gan(y_a_real, y_a_fake)
+        feat_loss_a = self.compute_loss_feat(feats_a_real, feats_a_fake)
+
+        gan_loss_dis_b, gan_loss_gen_b =\
+            self.compute_loss_gan(y_b_real, y_b_fake)
+        feat_loss_b = self.compute_loss_feat(feats_b_real, feats_b_fake)
 
         # compute loss
-        loss_gan = F.sum(
-            F.softplus(-y_a_fake) + F.softplus(-y_b_fake)) / batchsize
+        if self.iteration < 10000:
+            rate = 0.01
+        else:
+            rate = 0.5
 
-        loss_const_a = F.mean_squared_error(x_a, x_aba)
-        loss_const_b = F.mean_squared_error(x_b, x_bab)
+        total_loss_gen_a = (1.-rate)*(0.1*gan_loss_gen_b + 0.9*feat_loss_b) + \
+            rate * recon_loss_a
+        total_loss_gen_b = (1.-rate)*(0.1*gan_loss_gen_a + 0.9*feat_loss_a) + \
+            rate * recon_loss_b
 
-        loss_gen = loss_gan + loss_const_a + loss_const_b
+        gen_loss = total_loss_gen_a + total_loss_gen_b
+        dis_loss = gan_loss_dis_a + gan_loss_dis_b
 
-        # update
-        self.generator_ab.cleargrads()
-        self.generator_ba.cleargrads()
-        loss_gen.backward()
-        self._optimizers['generator_ab'].update()
-        self._optimizers['generator_ba'].update()
+        if self.iteration % 3 == 0:
+            self.discriminator_a.cleargrads()
+            self.discriminator_b.cleargrads()
+            dis_loss.backward()
+            self._optimizers['discriminator_a'].update()
+            self._optimizers['discriminator_b'].update()
+        else:
+            self.generator_ab.cleargrads()
+            self.generator_ba.cleargrads()
+            gen_loss.backward()
+            self._optimizers['generator_ab'].update()
+            self._optimizers['generator_ba'].update()
 
         # report
         chainer.reporter.report({
-            'loss/gan/real': loss_gan_real,
-            'loss/gan/fake': loss_gan_fake,
-            'loss/const': loss_const_a + loss_const_b})
+            'loss/generator': gen_loss,
+            'loss/feature maching loss': feat_loss_a + feat_loss_b,
+            'loss/recon': recon_loss_a + recon_loss_b,
+            'loss/discriminator': dis_loss})
 
 
 def main():
@@ -283,19 +294,20 @@ def main():
             elif row[21] == '-1':
                 list_b.append(path)
 
-    train_a = PreprocessedDataset(list_a[:80000], os.path.join(
+    print('dataset A: {}'.format(len(list_a)))
+    print('dataset B: {}'.format(len(list_b)))
+
+    train_a = PreprocessedDataset(list_a[:-10], os.path.join(
         args.directory, 'Img/img_align_celeba_png/'))
-    train_b = PreprocessedDataset(list_b[:80000], os.path.join(
+    train_b = PreprocessedDataset(list_b[:-10], os.path.join(
         args.directory, 'Img/img_align_celeba_png/'))
-    valid_a = PreprocessedDataset(list_a[80000:80010], os.path.join(
+    valid_a = PreprocessedDataset(list_a[-10:], os.path.join(
         args.directory, 'Img/img_align_celeba_png/'), random=False)
-    valid_b = PreprocessedDataset(list_b[80000:80010], os.path.join(
+    valid_b = PreprocessedDataset(list_b[-10:], os.path.join(
         args.directory, 'Img/img_align_celeba_png/'), random=False)
 
-    train_iter_a = chainer.iterators.MultiprocessIterator(
-        train_a, args.batchsize, n_processes=args.loaderjob // 2)
-    train_iter_b = chainer.iterators.MultiprocessIterator(
-        train_b, args.batchsize, n_processes=args.loaderjob // 2)
+    train_iter_a = chainer.iterators.SerialIterator(train_a, args.batchsize)
+    train_iter_b = chainer.iterators.SerialIterator(train_b, args.batchsize)
     valid_iter_a = chainer.iterators.SerialIterator(valid_a, 10, shuffle=False)
     valid_iter_b = chainer.iterators.SerialIterator(valid_b, 10, shuffle=False)
 
@@ -310,17 +322,19 @@ def main():
             # read data
             batch_a = iterator_a.next()
             x_a = convert.concat_examples(batch_a, device)
+            x_a = chainer.Variable(x_a, volatile='on')
 
             batch_b = iterator_b.next()
             x_b = convert.concat_examples(batch_b, device)
+            x_b = chainer.Variable(x_b, volatile='on')
 
             # conversion
             x_ab = generator_ab(x_a, test=True)
             x_ba = generator_ba(x_b, test=True)
 
             # to cpu
-            x_a = chainer.cuda.to_cpu(x_a)
-            x_b = chainer.cuda.to_cpu(x_b)
+            x_a = chainer.cuda.to_cpu(x_a.data)
+            x_b = chainer.cuda.to_cpu(x_b.data)
             x_ab = chainer.cuda.to_cpu(x_ab.data)
             x_ba = chainer.cuda.to_cpu(x_ba.data)
 
@@ -343,18 +357,24 @@ def main():
             Image.fromarray(x).save(preview_path)
         return make_image
 
-    trainer.extend(extensions.dump_graph('loss/gan/real'))
-    trainer.extend(extensions.snapshot(), trigger=(args.epoch, 'epoch'))
+    trainer.extend(extensions.snapshot())
+    trainer.extend(extensions.snapshot_object(
+        generator_ab, 'generator_ab{.updater.epoch}'))
+    trainer.extend(extensions.snapshot_object(
+        generator_ba, 'generator_ba{.updater.epoch}'))
+    trainer.extend(extensions.snapshot_object(
+        discriminator_a, 'discriminator_a{.updater.epoch}'))
+    trainer.extend(extensions.snapshot_object(
+        discriminator_b, 'discriminator_b{.updater.epoch}'))
     trainer.extend(extensions.LogReport())
-    trainer.extend(
-        extensions.PlotReport(['loss/const'],
-                              'epoch', file_name='const.png'))
-    trainer.extend(
-        extensions.PlotReport(
-            ['loss/gan/real', 'loss/gan/fake'], 'epoch', file_name='gan.png'))
+    trainer.extend(extensions.PlotReport(['loss/recon'], 'epoch',
+                   file_name='recon.png'))
+    trainer.extend(extensions.PlotReport(
+        ['loss/generator', 'loss/discriminator', 'loss/feature maching loss'],
+        'epoch', file_name='gan.png'))
     trainer.extend(extensions.PrintReport(
-        ['epoch', 'loss/gan/real', 'loss/gan/fake',
-         'loss/const', 'elapsed_time']))
+        ['epoch', 'loss/generator', 'loss/feature maching loss', 'loss/recon',
+         'loss/discriminator', 'elapsed_time']))
     trainer.extend(extensions.ProgressBar(update_interval=5))
     trainer.extend(out_generated_image(valid_iter_a, valid_iter_b,
                                        generator_ab, generator_ba,
